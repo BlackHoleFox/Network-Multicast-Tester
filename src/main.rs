@@ -67,9 +67,12 @@ fn launch_broadcaster(bind_addr: SocketAddr) {
     println!("Make sure the listener is ready before starting");
 
     let listener_rcounter = response_counter.clone();
-    let _response_listener_thread = thread::Builder::new().name("response_listener".to_string()).spawn(move || {
+    match thread::Builder::new().name("response_listener".to_string()).spawn(move || {
         response_listener(bind_addr, response_counter)
-    }).unwrap();
+    }) {
+        Ok(_) => {}
+        Err(_) => {}
+    }
 
     multi_broadcaster(bind_addr, listener_rcounter);
 }
@@ -95,10 +98,10 @@ fn multi_broadcaster(bind_addr: SocketAddr, response_counter: Arc<Mutex<[u8; 10]
     let test_packetdata = "General Kenobi!".as_bytes();
     for number in 0..10 {
         if number != 9 {
-            announcement_socket.send_to(test_packetdata, "239.0.0.5:14000").expect("Failed to multicast!");
+            announcement_socket.send_to(test_packetdata, "239.0.0.3:14000").expect("Failed to multicast!");
         } else {
             // Let the caster know this is the last packet
-            announcement_socket.send_to("Until next time!".as_bytes(), "239.0.0.5:14000").expect("Failed to multicast final packet!");
+            announcement_socket.send_to("Until next time!".as_bytes(), "239.0.0.3:14000").expect("Failed to multicast final packet!");
         }
         
         println!("Sending packet {}...", number + 1);
