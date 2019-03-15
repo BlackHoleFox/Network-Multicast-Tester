@@ -36,10 +36,14 @@ fn main() {
             io::stdin().read_line(&mut mode_choice).unwrap();
             let mode_choice = String::from(mode_choice.trim_end_matches(|c| c == '\n' || c == '\r'));
 
-            match mode_choice.as_str() {
+            match mode_choice.to_uppercase().as_str() {
                 "S" => launch_broadcaster(bind_addr),
                 "R" => launch_receiver(bind_addr, local_ip),
-                &_ => continue
+                "" => {
+                    println!("Exiting!"); 
+                    break
+                }
+                _ => {}
             }
 
         } else { break }
@@ -67,12 +71,9 @@ fn launch_broadcaster(bind_addr: SocketAddr) {
     println!("Make sure the listener is ready before starting");
 
     let listener_rcounter = response_counter.clone();
-    match thread::Builder::new().name("response_listener".to_string()).spawn(move || {
+    thread::Builder::new().name("response_listener".to_string()).spawn(move || {
         response_listener(bind_addr, response_counter)
-    }) {
-        Ok(_) => {}
-        Err(_) => {}
-    }
+    }).ok();
 
     multi_broadcaster(bind_addr, listener_rcounter);
 }
@@ -98,7 +99,7 @@ fn multi_broadcaster(bind_addr: SocketAddr, response_counter: Arc<Mutex<[u8; 10]
     let test_packetdata = "General Kenobi!".as_bytes();
     for number in 0..10 {
         if number != 9 {
-            announcement_socket.send_to(test_packetdata, "239.0.0.3:14000").expect("Failed to multicast!");
+            announcement_socket.send_to(test_packetdata, "239.0.0.3:14000").expect("Failed to multicast packet!");
         } else {
             // Let the caster know this is the last packet
             announcement_socket.send_to("Until next time!".as_bytes(), "239.0.0.3:14000").expect("Failed to multicast final packet!");
