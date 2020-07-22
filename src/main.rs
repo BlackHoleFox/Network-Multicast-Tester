@@ -1,134 +1,216 @@
 use std::net::{Ipv4Addr, SocketAddr};
-use std::net::{UdpSocket, TcpStream, TcpListener};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 
+use std::env;
+use std::fmt;
+use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
-use std::env::args;
-use std::io::{self, Write, Read};
+use std::thread;
 use std::time::Duration;
-use std::thread::{self, sleep};
-use std::str::FromStr;
 
-fn main() {
-    println!("Network Multicast Tester");
-    println!("-----------------------------");
+const SENDER_MODE_FLAG: &str = "--sender";
+const RECEIVER_MODE_FLAG: &str = "--receiver";
 
-    println!("Please enter this systems in-use IPv4 address (Come on winapi...): ");
-    let (bind_addr, local_ip) = loop {
-        let mut local_ip_addr = String::new();
-        io::stdin().read_line(&mut local_ip_addr).unwrap();
-        let local_ip_addr = String::from(local_ip_addr.trim_end_matches(|c| c == '\n' || c == '\r'));
-        match Ipv4Addr::from_str(&local_ip_addr) {
-            Ok(addr) => {
-                break (SocketAddr::from((addr, 14000)), addr);
-            }
-            Err(_) => {
-                println!("An improper IP address was entered, please try again!");
-            }
-        }
-    };
+const GREETER_TEST_PACKET_DATA: &[u8] = b"General Kenobi!";
+const ACK_TEST_PACKET_DATA: &[u8] = b"Hello there!";
+const FINALE_TEST_PACKET_DATA: &[u8] = b"Until next time!";
+const MULTICAST_IP: &str = "239.0.0.3:14000";
 
-    loop {
-        if args().len() == 0 | 1 {
-            println!("No mode specified, falling back to selection!");
-            println!("Enter 'S' for broadcaster mode or 'R' for receiver mode: ");
+#[derive(Debug)]
+enum Error {
+    SocketBind(io::Error),
+    Connection(io::Error),
+    ReadData,
+    SendData,
+    BadArguments,
+    StdIn,
+}
 
-            let mut mode_choice = String::new();
-            io::stdin().read_line(&mut mode_choice).unwrap();
-            let mode_choice = String::from(mode_choice.trim_end_matches(|c| c == '\n' || c == '\r'));
-
-            match mode_choice.to_uppercase().as_str() {
-                "S" => launch_broadcaster(bind_addr),
-                "R" => launch_receiver(bind_addr, local_ip),
-                "" => {
-                    println!("Exiting!"); 
-                    break
-                }
-                _ => {}
-            }
-
-        } else { break }
-    }
-
-    for argument in args() {
-        // Skip the default executable path
-        if args().nth(0) == Some(argument.to_owned()) { continue };
-        if argument == "--sender" {
-            launch_broadcaster(bind_addr);
-        } else if argument == "--receiver" {
-            launch_receiver(bind_addr, local_ip);
-        }
-        else {
-            println!("Improper arguments received, try again!")
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::SocketBind(e) => write!(f, "Failed to bind to a socket: {}", e),
+            Error::Connection(e) => write!(f, "Failed to connect to a peer: {}", e),
+            Error::ReadData => write!(f, "Failed to read data from a peer!"),
+            Error::SendData => write!(
+                f,
+                "Failed to respond with data to a caster, check your connection!"
+            ),
+            Error::BadArguments => write!(f, "Invalid CLI arguments were supplied!"),
+            Error::StdIn => write!(f, "Failed to read data from the command line!"),
         }
     }
 }
 
-fn launch_broadcaster(bind_addr: SocketAddr) {
-    let response_counter: Arc<Mutex<[u8; 10]>> = Arc::new(Mutex::from([0; 10]));
+fn main() {
+    if let Err(e) = app_main() {
+        eprintln!("An error occured: {}", e)
+    }
+}
 
-    println!("-----------------------------");
+fn app_main() -> Result<(), Error> {
+    println!("Network Multicast Tester");
+    terminal_seperator();
+
+    println!("Please enter this systems in-use IPv4 address (Come on winapi...): ");
+    let bind_addr = loop {
+        let local_ip_addr = read_user_string()?;
+
+        let local_ip_addr = local_ip_addr.trim_end_matches(|c| c == '\n' || c == '\r');
+        if let Ok(addr) = local_ip_addr.parse::<Ipv4Addr>() {
+            break SocketAddr::from((addr, 14000));
+        } else {
+            eprintln!("An improper IP address was entered, please try again!");
+        }
+    };
+
+    let cmd_args = env::args();
+    if cmd_args.len() < 2 {
+        loop {
+            println!("No mode specified, falling back to selection!");
+            println!("Enter 'S' for broadcaster mode or 'R' for receiver mode: ");
+
+            let mode_choice = read_user_string()?;
+            let mode_choice = mode_choice.trim_end_matches(|c| c == '\n' || c == '\r');
+            match mode_choice.to_uppercase().as_str() {
+                "S" => return launch_broadcaster(bind_addr),
+                "R" => return launch_receiver(bind_addr),
+                _ => continue,
+            }
+        }
+    }
+
+    let mode_arg = env::args().nth(1).ok_or(Error::BadArguments)?;
+    match mode_arg.as_str() {
+        SENDER_MODE_FLAG => launch_broadcaster(bind_addr),
+        RECEIVER_MODE_FLAG => launch_receiver(bind_addr),
+        _ => Err(Error::BadArguments),
+    }
+}
+
+fn launch_broadcaster(bind_addr: SocketAddr) -> Result<(), Error> {
+    let response_counter = Arc::new(Mutex::from([0; 10]));
+
+    terminal_seperator();
     println!("Testing as the broadcaster!");
     println!("Make sure the listener is ready before starting");
 
     let listener_rcounter = response_counter.clone();
-    thread::Builder::new().name("response_listener".to_string()).spawn(move || {
-        response_listener(bind_addr, response_counter)
-    }).ok();
+    let res = thread::Builder::new()
+        .name("response_listener".to_string())
+        .spawn(move || {
+            let listener = TcpListener::bind(bind_addr).map_err(Error::SocketBind)?;
 
-    multi_broadcaster(bind_addr, listener_rcounter);
+            for pc in 0..10 {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut response = String::new();
+                        stream
+                            .read_to_string(&mut response)
+                            .map_err(|_| Error::ReadData)?;
+
+                        // Mark the packet's received status to true
+                        response_counter.lock().unwrap()[pc] = 1;
+                    }
+                    Err(_) => return Err(Error::ReadData),
+                }
+            }
+
+            Ok(())
+        })
+        .unwrap();
+
+    multi_broadcaster(bind_addr, listener_rcounter)?;
+
+    res.join().unwrap()
 }
 
-fn launch_receiver(bind_addr: SocketAddr, local_ip: Ipv4Addr) {
-    println!("-----------------------------");
+fn launch_receiver(bind_addr: SocketAddr) -> Result<(), Error> {
+    terminal_seperator();
     println!("Testing as the receiver!");
-    println!("-----------------------------");
-    multi_receiver(bind_addr, local_ip);
-}
+    terminal_seperator();
 
-fn multi_broadcaster(bind_addr: SocketAddr, response_counter: Arc<Mutex<[u8; 10]>>) {
-    println!("Press any key to start tests: ");
-    let mut test_start = String::new();
-    io::stdin().read_line(&mut test_start).unwrap();
+    let receiver_socket = UdpSocket::bind(bind_addr).map_err(Error::SocketBind)?;
 
-    println!("Creating announcement socket...");
-    let announcement_socket = UdpSocket::bind(bind_addr).expect("Failed to bind to port!");
+    let recv_address = match bind_addr.ip() {
+        std::net::IpAddr::V4(addr) => addr,
+        _ => unreachable!(),
+    };
 
-    println!("Sending a set of 10 multicast packets...");
-    println!("-----------------------------");
+    receiver_socket
+        .join_multicast_v4(&Ipv4Addr::new(239, 0, 0, 3), &recv_address)
+        .map_err(Error::SocketBind)?;
 
-    let test_packetdata = "General Kenobi!".as_bytes();
-    for number in 0..10 {
-        if number != 9 {
-            announcement_socket.send_to(test_packetdata, "239.0.0.3:14000").expect("Failed to multicast packet!");
-        } else {
-            // Let the caster know this is the last packet
-            announcement_socket.send_to("Until next time!".as_bytes(), "239.0.0.3:14000").expect("Failed to multicast final packet!");
-        }
-        
-        println!("Sending packet {}...", number + 1);
-        sleep(Duration::new(1, 0)); // Little bit of a delay to avoid sending them all under exact conditions
+    let mut recv_buffer: Vec<u8> = vec![0; 65536];
+    for _ in 0..10 {
+        let (_, caster_ip) = receiver_socket
+            .recv_from(&mut recv_buffer)
+            .map_err(|_| Error::ReadData)?;
+
+        println!("Received a packet from the broadcaster!");
+
+        let mut responder = TcpStream::connect(caster_ip).map_err(Error::Connection)?;
+        responder
+            .write(ACK_TEST_PACKET_DATA)
+            .map_err(|_| Error::SendData)?;
     }
 
-    println!("-----------------------------");
-    let mut packet_counter = 0;
+    // We got the last packet, exit now
+    terminal_seperator();
+    println!("Test completed, press any key to exit!");
+    read_user_string()?;
+    Ok(())
+}
+
+fn multi_broadcaster(
+    bind_addr: SocketAddr,
+    response_counter: Arc<Mutex<[u8; 10]>>,
+) -> Result<(), Error> {
+    println!("Press any key to start tests: ");
+    read_user_string()?;
+
+    println!("Creating announcement socket...");
+    let announcement_socket = UdpSocket::bind(bind_addr).map_err(Error::SocketBind)?;
+
+    println!("Sending a set of 10 multicast packets...");
+    terminal_seperator();
+
+    for number in 0..10 {
+        if number != 9 {
+            announcement_socket
+                .send_to(GREETER_TEST_PACKET_DATA, MULTICAST_IP)
+                .map_err(|_| Error::SendData)?;
+        } else {
+            // Let the caster know this is the last packet
+            announcement_socket
+                .send_to(FINALE_TEST_PACKET_DATA, MULTICAST_IP)
+                .map_err(|_| Error::SendData)?;
+        }
+
+        println!("Sending packet {}...", number + 1);
+        thread::sleep(Duration::from_secs(1)); // Little bit of a delay to avoid sending them all under exact conditions
+    }
+
+    terminal_seperator();
     let mut total_valid_packets = 0;
-    for packet_response in response_counter.lock().unwrap().iter() {
+    for (p_count, packet_response) in response_counter.lock().unwrap().iter().enumerate() {
         let packet_is_valid = match packet_response {
-            0 => {
-                packet_counter += 1;
-                "No Response"
-            }
+            0 => "No Response",
             1 => {
-                packet_counter += 1;
                 total_valid_packets += 1;
                 "Had Response"
             }
-            &_ => "" // This should never trigger
+            &_ => unreachable!(),
         };
-        println!("Packet {}: {}", packet_counter, packet_is_valid)
+
+        println!("Packet {}: {}", p_count, packet_is_valid)
     }
-    println!("-----------------------------");
-    println!("We saw responses to {}/10 of the multicast packets", total_valid_packets);
+
+    println!(
+        "We saw responses to {}/10 of the multicast packets",
+        total_valid_packets
+    );
+
     match total_valid_packets {
         10 => println!("Multicast across the two devices is working!"),
 
@@ -138,62 +220,27 @@ fn multi_broadcaster(bind_addr: SocketAddr, response_counter: Arc<Mutex<[u8; 10]
         }
 
         _ => {
-            println!("Multicast appears to be partially working, though there is some packet loss.");
+            println!(
+                "Multicast appears to be partially working, though there is some packet loss."
+            );
             println!("If you're testing multicasts between wireless and wired devices, this is a common occurance.");
         }
     }
 
-    println!("-----------------------------");
-    println!("Test completed, press any key to exit");
-    let mut exit_now = String::new();
-    io::stdin().read_line(&mut exit_now).unwrap();
+    terminal_seperator();
+    println!("Test completed, press any key to exit...");
+    read_user_string()?;
+    Ok(())
 }
 
-fn multi_receiver(bind_addr: SocketAddr, local_ip: Ipv4Addr) {
-    let receiver_socket = UdpSocket::bind(bind_addr).expect("Failed to bind to port!");
-    receiver_socket.join_multicast_v4(&Ipv4Addr::new(239, 0, 0, 3), &local_ip).unwrap();
-
-    let mut recv_buffer: Vec<u8> = vec![0; 65536];
-    let mut packet_counter = 0;
-    loop {
-         if packet_counter >= 10 {
-            // We got the last packet, exit now
-            println!("-----------------------------");
-            println!("Test completed, press any key to exit!");
-            let mut exit_now = String::new();
-            io::stdin().read_line(&mut exit_now).unwrap();
-            break 
-        }
-        let (_, caster_ip) = receiver_socket.recv_from(&mut recv_buffer).unwrap();
-        packet_counter += 1;
-        println!("Received a packet from the broadcaster!");
-        
-        let mut responder = TcpStream::connect(caster_ip).expect("Failed to conenct to caster!");
-        match responder.write("Hello There!".as_bytes()) {
-            Ok(_) => {}
-            Err(_) => println!("Failed to respond to caster, please check your connection!")
-        }  
-    }
+fn read_user_string() -> Result<String, Error> {
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|_| Error::StdIn)?;
+    Ok(input)
 }
 
-fn response_listener(bind_addr: SocketAddr, response_counter: Arc<Mutex<[u8; 10]>>) {
-    let listener = TcpListener::bind(bind_addr).expect("Failed to bind TCP listener!");
-
-    let mut packet_iterator_count = 0;
-    loop {
-        if packet_iterator_count >= 10  {
-            break // Shutdown this thread only
-        }
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let mut response = String::new();
-                stream.read_to_string(&mut response).unwrap();
-
-                // Mark the packet's received status to true
-                response_counter.lock().unwrap()[packet_iterator_count] = 1;
-                packet_iterator_count += 1;
-            }
-            Err(e) => println!("{:?}", e)
-        }
-    }
+fn terminal_seperator() {
+    println!("------------------------");
 }
